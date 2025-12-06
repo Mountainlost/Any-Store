@@ -12,8 +12,8 @@ import json
 from datetime import datetime
 
 # ======== Notion 配置 ========
-NOTION_TOKEN = "占位"
-NOTION_DATABASE_ID = "占位"
+NOTION_TOKEN = "占位符"
+NOTION_DATABASE_ID = "2be4a0b3997080ac9fdfe1c439d30887"
 NOTION_VERSION = "2022-06-28"
 
 # —— 开关控制 ——
@@ -508,7 +508,7 @@ m2 = M.input_features_dai.v30(
         "high-low AS tr1\n"
         "abs(high-m_lag(close,1)) AS tr2\n"
         "abs(low-m_lag(close,1)) AS tr3\n"
-        "IF(tr1>=tr2 AND tr1>=tr3,1, IF(tr2>=tr3, tr2, tr3)) AS tr\n"
+        "IF(tr1>=tr2 AND tr1>=tr3, tr1, IF(tr2>=tr3, tr2, tr3)) AS tr\n"
         "m_ta_sma(tr, 10) AS atr\n"
         "hl2 + 3.0*atr AS st_upper\n"
         "IF(close > m_lag(st_upper,1) AND m_lag(close,1) <= m_lag(st_upper,2), 1, 0) AS st_buy\n"
