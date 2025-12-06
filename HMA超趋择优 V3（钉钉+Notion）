@@ -1,4 +1,4 @@
-# 策略名称：HMA超趋择优 V3（钉钉+Notion）
+# 策略名称：HMA超趋择优 V3（钉钉+Notion）回测20%+
 # -*- coding: utf-8 -*-
 from bigmodule import M
 
