@@ -1,0 +1,471 @@
+# https://www.joinquant.com/research
+# -*- coding: utf-8 -*-
+# @Time    : 2025/11/05
+# @Author  : Roshan
+# @File    : 成交额宽度分析_聚宽研究版.py
+# @Software: JoinQuant Research
+
+"""
+说明：
+在聚宽研究环境复现“成交额宽度防御分析.py”。
+按 20 日平均成交额将全市场分组，计算宽度与辅助指标，并在 Notebook 绘制主/副热力图。
+请仅在聚宽研究环境运行，勿在本地运行（避免 API 失败）。
+"""
+
+# ==============================================================================
+# 1. 全局参数（可在运行前统一修改）
+# ==============================================================================
+
+from jqdata import *  # 聚宽研究环境提供的API
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+import datetime as dt
+import time  # 轻量进度条使用
+
+# 时间范围（默认参照本地版本）
+START_DATE = '2025-07-01'  # 开始日期（字符串或 datetime.date）+20
+END_DATE = None            # None 表示取最新日期（将自动转换为今日）
+
+# 均线和成交额计算周期
+MA_PERIOD = 20              # 20日均线
+VOLUME_AVG_PERIOD = 20      # 20日平均成交额
+
+# 分组与过滤参数
+NUM_GROUPS = 20             # 分组数量
+REVERSE_GROUPS = True       # True 表示组1为成交额最高（反转分组）
+EXCLUDE_ST = True           # 是否过滤 ST 股票
+
+# 辅助指标参数
+SMALL_CAP_COUNT = 400       # 小盘热度样本数量（最小总市值前 N）
+LARGE_CAP_COUNT = 100       # 大盘热度样本数量（最大总市值前 N）
+
+# 绘图参数（Notebook展示）
+PLOT_STYLE = 'seaborn-whitegrid'
+HEATMAP_CMAP = 'coolwarm'
+ANNOTATE_CELLS = True       # 是否在热力图单元格显示数值
+ANNOT_FMT = '.0f'           # 热力图注释格式
+HEATMAP_GRID_LINEWIDTHS = 0.5
+FIG_BASE_HEIGHT = 10        # 基础高度（英寸）
+FIG_PER_ROW_HEIGHT = 0.15   # 每行增加高度（英寸）
+FIG_MAX_HEIGHT = 120        # 最大高度限制（英寸）
+
+# 绘图英文标签（避免 PNG 中中文无法显示，仅影响图形文本）
+PLOT_TITLE_MAIN = 'Turnover Width Analysis'           # 主图标题（英文）
+PLOT_TITLE_AUX = 'Auxiliary Metrics'                  # 副图标题（英文）
+PLOT_XLABEL = 'Turnover Groups (G1 highest turnover)' # 主图 X 轴标签（英文）
+PLOT_YLABEL = 'Trade Date'                            # 主图 Y 轴标签（英文）
+AUX_COL_RENAME = {                                    # 副图列名英文映射
+    '小盘热度': 'SmallCap Heat',
+    '大盘热度': 'LargeCap Heat',
+    '大小热度差': 'Small-Large Diff',
+    '市场均值': 'Market Avg'
+}
+
+# 性能优化参数
+USE_COUNT_FETCH = True      # 行情数据获取优先使用 count+end_date
+
+
+# ==============================================================================
+# 进度条参数（Notebook显示）
+# ==============================================================================
+SHOW_PROGRESS = True         # 是否显示进度条
+PROGRESS_MIN_INTERVAL = 0.5  # 无tqdm时，最低刷新间隔（秒）
+
+# 优先使用 tqdm；缺失时回退到轻量打印
+try:
+    from tqdm.auto import tqdm as _tqdm
+    _HAS_TQDM = True
+except Exception:
+    _tqdm = None
+    _HAS_TQDM = False
+
+
+def progress_iter(iterable, total=None, desc=''):
+    """进度条迭代器：优先用 tqdm；缺失时按秒打印轻量进度。"""
+    if not SHOW_PROGRESS:
+        for item in iterable:
+            yield item
+        return
+
+    if _HAS_TQDM:
+        for item in _tqdm(iterable, total=total, desc=desc):
+            yield item
+    else:
+        if total is None:
+            try:
+                total = len(iterable)
+            except Exception:
+                total = None
+        count = 0
+        last = time.time()
+        for item in iterable:
+            yield item
+            count += 1
+            now = time.time()
+            if now - last >= PROGRESS_MIN_INTERVAL:
+                if total:
+                    pct = count / total * 100.0
+                    print(f'{desc} 进度: {count}/{total} ({pct:.1f}%)', end='\r')
+                else:
+                    print(f'{desc} 已处理: {count}', end='\r')
+                last = now
+        # 完成后补一行
+        if total:
+            print(f'{desc} 完成: {count}/{total} (100%)')
+        else:
+            print(f'{desc} 完成: {count}')
+
+
+
+
+# ==============================================================================
+# 2. 数据获取
+# ==============================================================================
+
+def ensure_time_column(df):
+    """统一时间列为 'time'；支持 'time'/'date'/'datetime'/DatetimeIndex。"""
+    if 'time' in df.columns:
+        df['time'] = pd.to_datetime(df['time'], errors='coerce')
+        return df
+    elif 'date' in df.columns:
+        df = df.rename(columns={'date': 'time'})
+        df['time'] = pd.to_datetime(df['time'], errors='coerce')
+        return df
+    elif 'datetime' in df.columns:
+        df = df.rename(columns={'datetime': 'time'})
+        df['time'] = pd.to_datetime(df['time'], errors='coerce')
+        return df
+    elif isinstance(df.index, pd.DatetimeIndex):
+        df = df.reset_index().rename(columns={'index': 'time'})
+        df['time'] = pd.to_datetime(df['time'], errors='coerce')
+        return df
+    else:
+        raise KeyError("未找到用于日期的字段，如 'time'、'date' 或 'datetime'。")
+
+def _normalize_end_date(end_date):
+    """将 END_DATE=None 转换为今日日期字符串。"""
+    if end_date is None:
+        return dt.date.today().strftime('%Y-%m-%d')
+    if isinstance(end_date, (dt.date, dt.datetime)):
+        return end_date.strftime('%Y-%m-%d')
+    return str(end_date)
+
+
+def fetch_stock_pool(start_date):
+    """获取 A 股股票池（基于 start_date 查询时点）。"""
+    if isinstance(start_date, (dt.date, dt.datetime)):
+        sd = start_date.strftime('%Y-%m-%d')
+    else:
+        sd = str(start_date)
+    stocks = list(get_all_securities(types=['stock'], date=sd).index)
+    return stocks
+
+
+def fetch_price_data(stocks, start_date, end_date):
+    """获取多股日频后复权收盘价与成交额；返回 pivot 后的 close_df/money_df。"""
+    ed = _normalize_end_date(end_date)
+    # 优先使用 count+end_date 抓取，减少区间扫描开销
+    if USE_COUNT_FETCH:
+        trade_days = get_trade_days(start_date=start_date, end_date=ed)
+        cnt = len(trade_days)
+        price = get_price(
+            stocks,
+            end_date=ed,
+            count=cnt,
+            frequency='daily',
+            fields=['close', 'money'],
+            skip_paused=False,   # 多股请求必须 False 以保证日期对齐
+            fq='post',
+            panel=False          # 返回扁平表（包含 time、code 及字段列）
+        )
+    else:
+        price = get_price(
+            stocks,
+            start_date=start_date,
+            end_date=ed,
+            frequency='daily',
+            fields=['close', 'money'],
+            skip_paused=False,
+            fq='post',
+            panel=False
+        )
+
+    # 兼容返回格式：panel=False（推荐）走 pivot；历史版本可能 MultiIndex 直接切片。
+    if not isinstance(price, pd.DataFrame):
+        raise ValueError('get_price 未返回 DataFrame，无法处理。')
+
+    # 统一时间列并 pivot 为日期×股票的矩阵（close、money）
+    price = ensure_time_column(price)
+    price['time'] = pd.to_datetime(price['time']).dt.normalize()
+    if not {'time', 'code', 'close', 'money'}.issubset(set(price.columns)):
+        # 兼容历史 MultiIndex 情形
+        if isinstance(price.columns, pd.MultiIndex):
+            close_df = price['close']
+            money_df = price['money']
+        else:
+            raise ValueError('get_price 返回结构不含 time/code/close/money，无法转换。')
+    else:
+        close_df = price.pivot(index='time', columns='code', values='close')
+        money_df = price.pivot(index='time', columns='code', values='money')
+
+    # 仅保留日期部分作为索引（去掉具体时间）
+    close_df.index = pd.to_datetime(close_df.index).normalize()
+    money_df.index = pd.to_datetime(money_df.index).normalize()
+
+    return close_df, money_df
+
+
+def fetch_st_matrix(stocks, start_date, end_date):
+    """获取区间内 ST 标记矩阵（索引为日期，列为股票代码）。"""
+    ed = _normalize_end_date(end_date)
+    st_df = get_extras('is_st', stocks, start_date=start_date, end_date=ed, df=True)
+    st_df.index = pd.to_datetime(st_df.index).normalize()
+    return st_df
+
+
+# ==============================================================================
+# 3. 指标计算（向量化）
+# ==============================================================================
+
+def compute_indicators(close_df, money_df):
+    """向量化计算 MA20、AvgVolume20 及 Above_MA20。"""
+    ma20_df = close_df.rolling(window=MA_PERIOD, min_periods=MA_PERIOD).mean()
+    volavg20_df = money_df.rolling(window=VOLUME_AVG_PERIOD, min_periods=VOLUME_AVG_PERIOD).mean()
+    above_df = close_df > ma20_df
+
+    return ma20_df, volavg20_df, above_df
+
+
+# ==============================================================================
+# 4. 宽度指标计算
+# ==============================================================================
+
+def calculate_width_indicator(volavg20_df, above_df, st_df=None):
+    """按 AvgVolume20 等人数分组，计算各组 Above_MA20 百分比（*100）。"""
+    # 排名分箱 + np.bincount，替代逐日 qcut/groupby（更快）
+    dates = volavg20_df.index
+    codes = volavg20_df.columns
+
+    # 预对齐 ST 矩阵，True 表示 ST；取非 ST 参与计算
+    if EXCLUDE_ST and st_df is not None:
+        st_aligned = st_df.reindex(index=dates, columns=codes).fillna(False)
+    else:
+        st_aligned = None
+
+    # 有效性掩码：成交额均值非空；若提供 ST 则叠加非 ST
+    valid_mask_df = ~volavg20_df.isna()
+    if st_aligned is not None:
+        valid_mask_df &= (~st_aligned)
+
+    rows = []
+    row_dates = []
+    for date in progress_iter(dates, total=len(dates), desc='宽度指标计算'):
+        vol_row = volavg20_df.loc[date].values
+        above_row = above_df.loc[date].values.astype(np.uint8)
+        valid = valid_mask_df.loc[date].values
+
+        if not np.any(valid):
+            continue
+
+        vol_valid = vol_row[valid]
+        above_valid = above_row[valid]
+        n = vol_valid.shape[0]
+        # 稳定排序生成秩序号 0..n-1
+        order = np.argsort(vol_valid, kind='mergesort')
+        rank = np.empty(n, dtype=np.int32)
+        rank[order] = np.arange(n)
+
+        # 分箱映射到 0..NUM_GROUPS-1（等人数分组）
+        group_idx = (rank * NUM_GROUPS) // n
+        if REVERSE_GROUPS:
+            group_idx = (NUM_GROUPS - 1) - group_idx
+
+        # 每组强势占比：加权 bincount 计算均值（*100）
+        sum_above = np.bincount(group_idx, weights=above_valid, minlength=NUM_GROUPS)
+        cnt_group = np.bincount(group_idx, minlength=NUM_GROUPS)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            pct = np.where(cnt_group > 0, (sum_above / cnt_group) * 100.0, 0.0)
+
+        rows.append(pct)
+        row_dates.append(pd.to_datetime(date))
+
+    if not rows:
+        return pd.DataFrame()
+
+    columns = [f'组{i+1}' for i in range(NUM_GROUPS)]
+    width_df = pd.DataFrame(rows, index=row_dates, columns=columns)
+    width_df.index.name = '交易日期'
+    width_df.sort_index(inplace=True)
+    return width_df
+
+
+# ==============================================================================
+# 5. 辅助指标计算（按需每日估值）
+# ==============================================================================
+
+def fetch_market_cap_on_date(date, stocks):
+    """在指定日期获取多股票总市值（返回 Series[code -> market_cap]）。"""
+    date_str = pd.to_datetime(date).strftime('%Y-%m-%d')
+    # 仅取必要字段，减少 IO
+    q = query(valuation.code, valuation.market_cap).filter(valuation.code.in_(stocks))
+    df = get_fundamentals(q, date=date_str)
+    if df is None or df.empty:
+        return pd.Series(dtype='float64')
+    s = pd.Series(df['market_cap'].values, index=df['code'].values)
+    return s
+
+
+def calculate_aux_indicators(width_df, above_df, st_df, volavg20_df):
+    """计算小盘热度、大盘热度、大小热度差与市场均值（与 width_df 同索引）。"""
+    aux_df = pd.DataFrame(index=width_df.index)
+    small_cap_heat = {}
+    large_cap_heat = {}
+    for date in progress_iter(width_df.index, total=len(width_df.index), desc='辅助指标计算'):
+        # 仅针对当日有效样本请求估值，减少查询体量
+        valid_mask = ~volavg20_df.loc[date].isna()
+        above_series = above_df.loc[date].loc[valid_mask]
+        # ST过滤
+        if EXCLUDE_ST and st_df is not None and date in st_df.index:
+            st_mask = st_df.loc[date]
+            keep_codes = st_mask.index[~st_mask.values]
+            above_series = above_series.loc[above_series.index.intersection(keep_codes)]
+
+        # 获取当日估值（总市值），按需请求（仅当日有效且非ST的股票）
+        active_codes = list(above_series.index)
+        mktcap_series = fetch_market_cap_on_date(date, active_codes)
+        if mktcap_series.empty:
+            small_cap_heat[date] = 0
+            large_cap_heat[date] = 0
+            continue
+
+        # 对齐仅包含当日有判断的股票
+        mktcap_series = mktcap_series.loc[mktcap_series.index.intersection(above_series.index)]
+        if mktcap_series.empty:
+            small_cap_heat[date] = 0
+            large_cap_heat[date] = 0
+            continue
+
+        # 小盘热度
+        smallest = mktcap_series.nsmallest(SMALL_CAP_COUNT)
+        if smallest.empty:
+            small_cap_heat[date] = 0
+        else:
+            sel_above = above_series.loc[smallest.index].astype(bool)
+            small_cap_heat[date] = float(sel_above.mean() * 100.0)
+
+        # 大盘热度
+        largest = mktcap_series.nlargest(LARGE_CAP_COUNT)
+        if largest.empty:
+            large_cap_heat[date] = 0
+        else:
+            sel_above = above_series.loc[largest.index].astype(bool)
+            large_cap_heat[date] = float(sel_above.mean() * 100.0)
+
+    aux_df['小盘热度'] = pd.Series(small_cap_heat)
+    aux_df['大盘热度'] = pd.Series(large_cap_heat)
+
+    # 大小热度差（组1与组20差值绝对值）
+    if '组1' in width_df.columns and '组20' in width_df.columns:
+        aux_df['大小热度差'] = (width_df['组1'] - width_df['组20']).abs()
+    else:
+        aux_df['大小热度差'] = 0
+
+    # 市场均值（所有组的平均值）
+    aux_df['市场均值'] = width_df.mean(axis=1)
+
+    return aux_df
+
+
+# ==============================================================================
+# 6. 图表绘制（Notebook展示）
+# ==============================================================================
+
+def plot_heatmap(width_df, aux_df):
+    """绘制主（宽度矩阵）与副（辅助指标）热力图组合，仅在 Notebook 展示。"""
+    try:
+        plt.style.use(PLOT_STYLE)
+    except Exception:
+        pass
+    plt.rcParams['font.sans-serif'] = ['SimHei']
+    plt.rcParams['axes.unicode_minus'] = False
+
+    # 根据行数动态计算高度
+    num_rows = len(width_df)
+    fig_height = FIG_BASE_HEIGHT + num_rows * FIG_PER_ROW_HEIGHT
+    fig_height = min(fig_height, FIG_MAX_HEIGHT)
+
+    fig, (ax0, ax1) = plt.subplots(
+        1, 2, figsize=(15, fig_height), sharey=True,
+        gridspec_kw={'width_ratios': [25, 4], 'wspace': 0.05},
+        constrained_layout=True
+    )
+
+    # 按日期倒序显示（最近在上方），右侧辅助同步索引
+    plot_width = width_df.sort_index(ascending=False).copy()
+    plot_aux = aux_df.loc[plot_width.index].copy()
+
+    plot_width.index = pd.to_datetime(plot_width.index).strftime('%Y-%m-%d')
+    plot_aux.index = pd.to_datetime(plot_aux.index).strftime('%Y-%m-%d')
+
+    # 列名英文化：组列 -> G1..G20；副图中文列 -> 英文列
+    width_rename = {f'组{i+1}': f'G{i+1}' for i in range(NUM_GROUPS)}
+    plot_width.rename(columns=width_rename, inplace=True)
+    plot_aux.rename(columns=AUX_COL_RENAME, inplace=True)
+
+    sns.heatmap(plot_width, annot=ANNOTATE_CELLS, fmt=ANNOT_FMT,
+                cmap=HEATMAP_CMAP, ax=ax0, cbar=False, linewidths=HEATMAP_GRID_LINEWIDTHS)
+    ax0.set_title(PLOT_TITLE_MAIN, fontsize=20, pad=40)
+    ax0.set_xlabel(PLOT_XLABEL, fontsize=14)
+    ax0.set_ylabel(PLOT_YLABEL, fontsize=14)
+    ax0.xaxis.tick_top(); ax0.xaxis.set_label_position('top')
+    for label in ax0.get_yticklabels():
+        label.set_rotation(0)
+        label.set_ha('right')
+        label.set_fontweight('bold')
+    for label in ax0.get_xticklabels():
+        label.set_fontweight('bold')
+
+    sns.heatmap(plot_aux, annot=ANNOTATE_CELLS, fmt=ANNOT_FMT,
+                cmap=HEATMAP_CMAP, ax=ax1, cbar=False, linewidths=HEATMAP_GRID_LINEWIDTHS)
+    ax1.set_title(PLOT_TITLE_AUX, fontsize=20, pad=40)
+    ax1.set_xlabel('', fontsize=14)
+    ax1.xaxis.tick_top(); ax1.xaxis.set_label_position('top')
+    plt.setp(ax1.get_yticklabels(), visible=False)
+    for label in ax1.get_xticklabels():
+        label.set_fontweight('bold')
+
+    # Notebook展示
+    plt.show()
+
+
+# ==============================================================================
+# 7. 主流程
+# ==============================================================================
+
+def main():
+    """主流程：依次获取数据、计算指标并绘图展示。"""
+    # 1) 股票池与数据获取
+    stocks = fetch_stock_pool(START_DATE)
+    close_df, money_df = fetch_price_data(stocks, START_DATE, END_DATE)
+    st_df = fetch_st_matrix(stocks, START_DATE, END_DATE) if EXCLUDE_ST else None
+
+    # 2) 指标计算
+    ma20_df, volavg20_df, above_df = compute_indicators(close_df, money_df)
+
+    # 3) 宽度指标
+    width_df = calculate_width_indicator(volavg20_df, above_df, st_df)
+    if width_df.empty:
+        print('未能计算任何宽度指标，请检查时间范围与数据质量。')
+        return
+
+    # 4) 辅助指标
+    aux_df = calculate_aux_indicators(width_df, above_df, st_df, volavg20_df)
+
+    # 5) 绘图展示
+    plot_heatmap(width_df, aux_df)
+
+
+if __name__ == '__main__':
+    main()
