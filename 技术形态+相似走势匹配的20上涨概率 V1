@@ -1,0 +1,267 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from jqdata import *
+from datetime import datetime, timedelta
+
+# === 形态特征字段 ===
+SHAPE_FEATURE_COLS = [
+    'ma_5','ma_10','ma_20',
+    'price_above_ma20',
+    'atr14_pct','vol_ratio10','vol_ratio20',
+    'big_bull','break_high20'
+]
+
+# ------------------------------------------------
+# 代码识别：支持 300750 / '300750' / '300750.SZ'
+# ------------------------------------------------
+def auto_detect_code(code_like):
+    """
+    Research 环境可用：智能识别股票代码
+    输入可以是：300750、'300750'、'300750.SZ'
+    """
+    s = str(code_like).strip()
+
+    # 1) 已经带市场后缀的
+    if "." in s:
+        return s.upper()
+
+    # 2) 如果是纯数字（常见）
+    if s.isdigit() and len(s) == 6:
+        # 深市规则
+        if s.startswith(("0", "3")):
+            return s + ".XSHE"
+        # 沪市规则
+        elif s.startswith("6"):
+            return s + ".XSHG"
+        else:
+            return s + ".XSHG"
+
+    raise ValueError(f"无法识别股票代码：{code_like}")
+
+# ------------------------------------------------
+# 关键函数：为单只股票计算形态因子
+# ------------------------------------------------
+def compute_shape_factors_for_stock(code, start_date='2010-01-01', end_date=None):
+    """
+    返回一个 DataFrame，至少包含：
+    - date, open, high, low, close, volume
+    - SHAPE_FEATURE_COLS 中列出的所有字段
+    """
+    code = auto_detect_code(code)
+
+    if end_date is None:
+        end_date = datetime.today().strftime('%Y-%m-%d')
+
+    df = get_price(code, start_date=start_date, end_date=end_date, fq='pre')
+    if (df is None) or df.empty:
+        return pd.DataFrame()
+
+    # index 转为列
+    df = df.reset_index()
+    if 'index' in df.columns:
+        df = df.rename(columns={'index': 'date'})
+    elif 'time' in df.columns:
+        df = df.rename(columns={'time': 'date'})
+
+    # ========== 均线 ==========
+    df['ma_5'] = df['close'].rolling(5).mean()
+    df['ma_10'] = df['close'].rolling(10).mean()
+    df['ma_20'] = df['close'].rolling(20).mean()
+
+    # 价格是否在 MA20 之上
+    df['price_above_ma20'] = (df['close'] > df['ma_20']).astype(int)
+
+    # ========== ATR14 & ATR14_pct ==========
+    df['prev_close'] = df['close'].shift(1)
+    h_l  = df['high'] - df['low']
+    h_pc = (df['high'] - df['prev_close']).abs()
+    l_pc = (df['low']  - df['prev_close']).abs()
+    df['tr'] = pd.concat([h_l, h_pc, l_pc], axis=1).max(axis=1)
+    df['atr14'] = df['tr'].rolling(14).mean()
+    df['atr14_pct'] = df['atr14'] / df['close']
+
+    # ========== 成交量放大倍率 ==========
+    df['vol_ma10'] = df['volume'].rolling(10).mean()
+    df['vol_ma20'] = df['volume'].rolling(20).mean()
+    df['vol_ratio10'] = df['volume'] / df['vol_ma10']
+    df['vol_ratio20'] = df['volume'] / df['vol_ma20']
+
+    # ========== 大阳线标记 ==========
+    # 这里用收盘较开盘涨幅 ≥ 7% 作为大阳线，可以按需要调阈值
+    df['big_bull'] = ((df['close'] / df['open'] - 1) >= 0.07).astype(int)
+
+    # ========== 突破 20 日新高 ==========
+    # 用前 20 日最高价（不含当日）做比较
+    df['high20_prev'] = df['high'].rolling(20).max().shift(1)
+    df['break_high20'] = (df['close'] > df['high20_prev']).astype(int)
+
+    # 去掉特征中有 NaN 的预热期
+    df = df.dropna(subset=SHAPE_FEATURE_COLS).reset_index(drop=True)
+
+    return df
+
+# ------------------------------------------------
+# 形态相似度 + 未来收益统计
+# ------------------------------------------------
+def shape_winrate(code, as_of_date=None,
+                  start_date='2010-01-01',
+                  horizon=20, neighbor_count=200):
+
+    code = auto_detect_code(code)
+
+    # 1) 拿尽量完整的因子数据
+    df = compute_shape_factors_for_stock(code, start_date, None)
+    if df.empty:
+        raise ValueError("没有拿到任何价格数据，请检查代码或起始日期")
+
+    df = df.sort_values('date').reset_index(drop=True)
+
+        # ===== 2) 处理 as_of_date（评估日期）=====
+    if as_of_date is None:
+        # 自动取最后一个交易日的前一天
+        # df 已经是完整历史数据
+        if len(df) < 2:
+            raise ValueError("数据量不足，无法获取前一天")
+        as_of_date = df['date'].iloc[-2]   # 最新交易日的前一天
+    else:
+        as_of_date = pd.to_datetime(as_of_date)
+        df = df[df['date'] <= as_of_date].copy()
+        if df.empty:
+            raise ValueError("as_of_date 之前没有任何数据")
+
+
+    # 3) 计算未来 horizon 日收益（next_ret）
+    df['next_ret'] = df['close'].shift(-horizon) / df['close'] - 1
+
+    # 4) today_row：评估这一天的 K 线
+    today_row = df[df['date'] <= as_of_date].iloc[-1]
+    today_vec = today_row[SHAPE_FEATURE_COLS].values.astype(float)
+
+    # 5) 历史样本：只用 today_row 之前，且 next_ret 有值
+    hist_df = df[df['date'] < today_row['date']].copy()
+    hist_df = hist_df.dropna(subset=['next_ret']).reset_index(drop=True)
+    if hist_df.empty:
+        raise ValueError("没有足够的历史用来匹配相似形态")
+
+    # 6) 欧式距离
+    feats_mat = hist_df[SHAPE_FEATURE_COLS].values.astype(float)   # (N, K)
+    diff = feats_mat - today_vec.reshape(1, -1)                    # (N, K)
+    dist = (diff ** 2).sum(axis=1) ** 0.5                          # (N,)
+    hist_df['dist'] = dist
+
+    neighbors = hist_df.sort_values('dist').head(neighbor_count)
+
+    # 7) 统计未来 horizon 日收益分布
+    winrate = (neighbors['next_ret'] > 0).mean()
+    avg_ret = neighbors['next_ret'].mean()
+    p05 = neighbors['next_ret'].quantile(0.05)
+    p50 = neighbors['next_ret'].quantile(0.50)
+    p95 = neighbors['next_ret'].quantile(0.95)
+
+    print("======== 形态匹配结果（{}） ========".format(code))
+    print("评估日期:", today_row['date'].date())
+    print("可用历史样本:", len(hist_df))
+    print("匹配邻居数量:", len(neighbors))
+    print("未来 {} 日胜率: {:.2%}".format(horizon, winrate))
+    print("未来 {} 日均值收益: {:.2%}".format(horizon, avg_ret))
+    print("未来 {} 日收益 [5%, 50%, 95%]: {:.2%}, {:.2%}, {:.2%}".format(
+        horizon, p05, p50, p95))
+
+    return {
+        'today_row': today_row,
+        'neighbors': neighbors,
+        'stats': {
+            'winrate': winrate,
+            'avg_ret': avg_ret,
+            'p05': p05,
+            'p50': p50,
+            'p95': p95
+        }
+    }
+
+# ------------------------------------------------
+# 辅助画图：收益分布、形态距离 vs 收益、走势对比
+# ------------------------------------------------
+def plot_return_distribution(res, horizon=20):
+    neighbors = res['neighbors']
+    ret = neighbors['next_ret']
+
+    plt.figure(figsize=(8,5))
+    plt.hist(ret, bins=30, alpha=0.7)
+    plt.axvline(ret.mean(), linestyle='--', label='均值')
+    plt.title("未来 {} 日收益分布（形态相似样本）".format(horizon))
+    plt.legend()
+    plt.show()
+
+def plot_neighbors_scatter(res, horizon=20):
+    neighbors = res['neighbors']
+
+    plt.figure(figsize=(8,5))
+    plt.scatter(neighbors['dist'], neighbors['next_ret'], alpha=0.6)
+    plt.axhline(0, linestyle='--')
+    plt.xlabel("形态距离")
+    plt.ylabel("未来 {} 日收益".format(horizon))
+    plt.title("形态相似度 vs 收益")
+    plt.show()
+
+def plot_price_paths(code, res, horizon=20,
+                     pre_days=20, max_paths=20):
+
+    neighbors = res['neighbors'].head(max_paths)
+    plt.figure(figsize=(10,5))
+
+    # --- 历史走势 ---
+    for _, row in neighbors.iterrows():
+        start = row['date'] - pd.Timedelta(days=pre_days)
+        end   = row['date'] + pd.Timedelta(days=horizon)
+
+        df = get_price(code, start_date=start, end_date=end, fq='pre')
+        if df is None or df.empty:
+            continue
+
+        df['norm'] = df['close'] / df['close'].iloc[pre_days]
+        plt.plot(df['norm'], alpha=0.3)
+
+    # --- 当前走势 ---
+    today = res['today_row']['date']
+    start2 = today - pd.Timedelta(days=pre_days)
+    df2 = get_price(code, start_date=start2, end_date=today, fq='pre')
+    if (df2 is not None) and (not df2.empty):
+        df2['norm'] = df2['close'] / df2['close'].iloc[0]
+        plt.plot(df2['norm'], linewidth=2, label='当前形态')
+
+    plt.title("走势对比（{}）".format(code))
+    plt.legend()
+    plt.show()
+
+# ------------------------------------------------
+# 总入口函数
+# ------------------------------------------------
+def analyze_shape(code_like,
+                  as_of_date=None,
+                  start_date='2010-01-01',
+                  horizon=20,
+                  neighbor_count=200,
+                  pre_days=20,
+                  max_paths=20):
+
+    code = auto_detect_code(code_like)
+    print("识别股票代码:", code)
+
+    res = shape_winrate(
+        code=code,
+        as_of_date=as_of_date,
+        start_date=start_date,
+        horizon=horizon,
+        neighbor_count=neighbor_count
+    )
+
+    plot_return_distribution(res, horizon)
+    plot_neighbors_scatter(res, horizon)
+    plot_price_paths(code, res, horizon, pre_days, max_paths)
+
+    return res
+
+# 示例调用
+res = analyze_shape("300652")
