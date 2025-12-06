@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -6,10 +7,10 @@ from datetime import datetime, timedelta
 
 # === 形态特征字段 ===
 SHAPE_FEATURE_COLS = [
-    'ma_5','ma_10','ma_20',
+    'ma_5', 'ma_10', 'ma_20',
     'price_above_ma20',
-    'atr14_pct','vol_ratio10','vol_ratio20',
-    'big_bull','break_high20'
+    'atr14_pct', 'vol_ratio10', 'vol_ratio20',
+    'big_bull', 'break_high20'
 ]
 
 # ------------------------------------------------
@@ -74,9 +75,9 @@ def compute_shape_factors_for_stock(code, start_date='2010-01-01', end_date=None
 
     # ========== ATR14 & ATR14_pct ==========
     df['prev_close'] = df['close'].shift(1)
-    h_l  = df['high'] - df['low']
+    h_l = df['high'] - df['low']
     h_pc = (df['high'] - df['prev_close']).abs()
-    l_pc = (df['low']  - df['prev_close']).abs()
+    l_pc = (df['low'] - df['prev_close']).abs()
     df['tr'] = pd.concat([h_l, h_pc, l_pc], axis=1).max(axis=1)
     df['atr14'] = df['tr'].rolling(14).mean()
     df['atr14_pct'] = df['atr14'] / df['close']
@@ -88,11 +89,9 @@ def compute_shape_factors_for_stock(code, start_date='2010-01-01', end_date=None
     df['vol_ratio20'] = df['volume'] / df['vol_ma20']
 
     # ========== 大阳线标记 ==========
-    # 这里用收盘较开盘涨幅 ≥ 7% 作为大阳线，可以按需要调阈值
     df['big_bull'] = ((df['close'] / df['open'] - 1) >= 0.07).astype(int)
 
     # ========== 突破 20 日新高 ==========
-    # 用前 20 日最高价（不含当日）做比较
     df['high20_prev'] = df['high'].rolling(20).max().shift(1)
     df['break_high20'] = (df['close'] > df['high20_prev']).astype(int)
 
@@ -110,32 +109,36 @@ def shape_winrate(code, as_of_date=None,
 
     code = auto_detect_code(code)
 
-    # 1) 拿尽量完整的因子数据
+    # 1) 拿尽量完整的因子数据（先不过滤 as_of_date，方便后面画路径）
     df = compute_shape_factors_for_stock(code, start_date, None)
     if df.empty:
         raise ValueError("没有拿到任何价格数据，请检查代码或起始日期")
 
     df = df.sort_values('date').reset_index(drop=True)
 
-        # ===== 2) 处理 as_of_date（评估日期）=====
+    # ===== 2) 处理 as_of_date（评估日期）=====
     if as_of_date is None:
-        # 自动取最后一个交易日的前一天
-        # df 已经是完整历史数据
+        # 自动取最后一个交易日的前一天（留出一天作为“未来”的空间）
         if len(df) < 2:
             raise ValueError("数据量不足，无法获取前一天")
-        as_of_date = df['date'].iloc[-2]   # 最新交易日的前一天
+        as_of_date = df['date'].iloc[-2]
     else:
         as_of_date = pd.to_datetime(as_of_date)
-        df = df[df['date'] <= as_of_date].copy()
-        if df.empty:
-            raise ValueError("as_of_date 之前没有任何数据")
 
+    # 只保留 as_of_date 之前的全部数据（含 as_of_date）
+    df = df[df['date'] <= as_of_date].copy()
+    if df.empty:
+        raise ValueError("as_of_date 之前没有任何数据")
+
+    # 重新排序 & 编号（后面用 idx 定位未来路径）
+    df = df.sort_values('date').reset_index(drop=True)
+    df['idx'] = np.arange(len(df))
 
     # 3) 计算未来 horizon 日收益（next_ret）
     df['next_ret'] = df['close'].shift(-horizon) / df['close'] - 1
 
-    # 4) today_row：评估这一天的 K 线
-    today_row = df[df['date'] <= as_of_date].iloc[-1]
+    # 4) today_row：评估这一天的 K 线（就是最后一行）
+    today_row = df.iloc[-1]
     today_vec = today_row[SHAPE_FEATURE_COLS].values.astype(float)
 
     # 5) 历史样本：只用 today_row 之前，且 next_ret 有值
@@ -171,6 +174,7 @@ def shape_winrate(code, as_of_date=None,
     return {
         'today_row': today_row,
         'neighbors': neighbors,
+        'df_all': df,   # 用于后面拼接过去/未来路径
         'stats': {
             'winrate': winrate,
             'avg_ret': avg_ret,
@@ -181,13 +185,13 @@ def shape_winrate(code, as_of_date=None,
     }
 
 # ------------------------------------------------
-# 辅助画图：收益分布、形态距离 vs 收益、走势对比
+# 辅助画图：收益分布、形态距离 vs 收益
 # ------------------------------------------------
 def plot_return_distribution(res, horizon=20):
     neighbors = res['neighbors']
     ret = neighbors['next_ret']
 
-    plt.figure(figsize=(8,5))
+    plt.figure(figsize=(8, 5))
     plt.hist(ret, bins=30, alpha=0.7)
     plt.axvline(ret.mean(), linestyle='--', label='均值')
     plt.title("未来 {} 日收益分布（形态相似样本）".format(horizon))
@@ -197,7 +201,7 @@ def plot_return_distribution(res, horizon=20):
 def plot_neighbors_scatter(res, horizon=20):
     neighbors = res['neighbors']
 
-    plt.figure(figsize=(8,5))
+    plt.figure(figsize=(8, 5))
     plt.scatter(neighbors['dist'], neighbors['next_ret'], alpha=0.6)
     plt.axhline(0, linestyle='--')
     plt.xlabel("形态距离")
@@ -205,35 +209,181 @@ def plot_neighbors_scatter(res, horizon=20):
     plt.title("形态相似度 vs 收益")
     plt.show()
 
-def plot_price_paths(code, res, horizon=20,
-                     pre_days=20, max_paths=20):
+# ------------------------------------------------
+# 走势对比 + 未来概率带（绿线 + 黑/灰/浅灰）
+# ------------------------------------------------
+def plot_price_paths(code, res,
+                     horizon=20,
+                     pre_days=60,
+                     max_neighbors_for_band=None,
+                     line_path_count=20):
+    """
+    绿线：当前标的过去 pre_days 个交易日（归一到今天=1）
+    浅灰 / 深灰 + 黑线：未来区间 5%-95% / 25%-75% / 中位数
+    红线：代表性邻居路径（数量= line_path_count）：
+        - 上涨 / 下跌条数按历史邻居“20日后涨跌比例”来分配
+        - 每组内部按终点收益分位数均匀抽样
+    """
 
-    neighbors = res['neighbors'].head(max_paths)
-    plt.figure(figsize=(10,5))
+    df_all = res['df_all']
+    today_row = res['today_row']
+    neighbors = res['neighbors']
 
-    # --- 历史走势 ---
+    if max_neighbors_for_band is not None:
+        neighbors = neighbors.head(max_neighbors_for_band)
+
+    # ---------- 构造“过去”路径（绿线） ----------
+    today_idx = int(today_row['idx'])
+    start_idx = max(0, today_idx - pre_days)
+    df_past = df_all.iloc[start_idx: today_idx + 1].copy()
+    past_close = df_past['close'].values
+    if len(past_close) < 2:
+        print("历史数据太短，无法绘制过去走势")
+        return
+
+    # 今天=1 归一化
+    past_norm = past_close / past_close[-1]
+    past_len = len(past_norm)
+
+    # ---------- 构造邻居未来路径矩阵 ----------
+    future_paths = []
     for _, row in neighbors.iterrows():
-        start = row['date'] - pd.Timedelta(days=pre_days)
-        end   = row['date'] + pd.Timedelta(days=horizon)
-
-        df = get_price(code, start_date=start, end_date=end, fq='pre')
-        if df is None or df.empty:
+        idx0 = int(row['idx'])
+        future_slice = df_all.iloc[idx0: idx0 + horizon + 1]
+        if len(future_slice) < horizon + 1:
             continue
+        prices = future_slice['close'].values
+        prices_norm = prices / prices[0]       # 邻居当日=1
+        future_paths.append(prices_norm[1:])   # 未来 1~horizon
 
-        df['norm'] = df['close'] / df['close'].iloc[pre_days]
-        plt.plot(df['norm'], alpha=0.3)
+    if not future_paths:
+        print("未来路径不足，无法绘制概率带")
+        return
 
-    # --- 当前走势 ---
-    today = res['today_row']['date']
-    start2 = today - pd.Timedelta(days=pre_days)
-    df2 = get_price(code, start_date=start2, end_date=today, fq='pre')
-    if (df2 is not None) and (not df2.empty):
-        df2['norm'] = df2['close'] / df2['close'].iloc[0]
-        plt.plot(df2['norm'], linewidth=2, label='当前形态')
+    future_mat = np.vstack(future_paths)       # (n_neighbors, horizon)
+    future_len = future_mat.shape[1]
 
-    plt.title("走势对比（{}）".format(code))
-    plt.legend()
+    # ---------- 概率带（先算未来，然后在前面补一个“今天=1”） ----------
+    p05 = np.nanpercentile(future_mat, 5, axis=0)
+    p25 = np.nanpercentile(future_mat, 25, axis=0)
+    p50 = np.nanpercentile(future_mat, 50, axis=0)
+    p75 = np.nanpercentile(future_mat, 75, axis=0)
+    p95 = np.nanpercentile(future_mat, 95, axis=0)
+
+    p05_full = np.concatenate([[1.0], p05])
+    p25_full = np.concatenate([[1.0], p25])
+    p50_full = np.concatenate([[1.0], p50])
+    p75_full = np.concatenate([[1.0], p75])
+    p95_full = np.concatenate([[1.0], p95])
+
+    # ---------- 相对时间轴 ----------
+    x_past = np.linspace(-1.0, 0.0, past_len)
+    x_future_full = np.linspace(0.0, 2.0, future_len + 1)   # 含 t=0
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.set_facecolor("#F9F9F9")
+
+    # 1）历史走势（绿线）
+    ax.plot(x_past, past_norm, color="green", linewidth=2,
+            label="历史走势（当前标的）")
+
+    # 2）未来概率带（从“今天=1”开始连续）
+    ax.fill_between(x_future_full, p05_full, p95_full,
+                    color="lightgray", alpha=0.3,
+                    label="未来区间 5%-95%")
+    ax.fill_between(x_future_full, p25_full, p75_full,
+                    color="gray", alpha=0.5,
+                    label="未来区间 25%-75%")
+    ax.plot(x_future_full, p50_full, color="black", linewidth=2,
+            label="未来中位数路径")
+
+    # 3）代表性的红色路径：上涨/下跌条数按比例分配
+    if line_path_count > 0:
+        # 以终点价格判断涨跌（>1 为涨）
+        end_price = future_mat[:, -1]
+        end_ret = end_price - 1.0
+        up_mask = end_ret >= 0
+        down_mask = ~up_mask
+
+        up_count_all = up_mask.sum()
+        down_count_all = down_mask.sum()
+        total_all = len(end_ret)
+
+        if total_all == 0:
+            print("没有可用邻居路径")
+        else:
+            # 历史上涨比例
+            up_ratio = up_count_all / float(total_all)
+
+            # 分配条数
+            up_lines = int(round(up_ratio * line_path_count))
+            up_lines = min(up_lines, up_count_all)
+            up_lines = max(up_lines, 0)
+
+            down_lines = line_path_count - up_lines
+            down_lines = min(down_lines, down_count_all)
+            down_lines = max(down_lines, 0)
+
+            # 如果某一类不足，剩余从另一类补
+            remain = line_path_count - (up_lines + down_lines)
+            if remain > 0:
+                if up_count_all - up_lines >= remain:
+                    up_lines += remain
+                elif down_count_all - down_lines >= remain:
+                    down_lines += remain
+
+            def draw_group(mask, n_lines):
+                if n_lines <= 0 or mask.sum() == 0:
+                    return
+                group_mat = future_mat[mask]
+                group_ret = end_ret[mask]
+                # 在该组内部按分位数抽样
+                qs = np.linspace(0, 100, n_lines + 2)[1:-1]
+                used_idx = set()
+                for q in qs:
+                    target = np.percentile(group_ret, q)
+                    idx_local = int(np.argmin(np.abs(group_ret - target)))
+                    shift = 0
+                    # 尽量避免重复
+                    while idx_local in used_idx and shift < len(group_ret):
+                        idx_local = (idx_local + 1) % len(group_ret)
+                        shift += 1
+                    used_idx.add(idx_local)
+                    y_full = np.concatenate([[1.0], group_mat[idx_local]])
+                    ax.plot(x_future_full, y_full,
+                            color="red", alpha=0.7, linewidth=1)
+
+            # 先画上涨组，再画下跌组（都用红色，只是数量不同比例）
+            draw_group(up_mask, up_lines)
+            draw_group(down_mask, down_lines)
+
+    # 4）今天的位置
+    ax.axvline(0, color="black", linewidth=1, linestyle="--")
+
+    # ---------- 外观 ----------
+    title = "走势对比与未来区间 ({})".format(code)
+    ax.set_title(title)
+
+    ymin = np.nanmin(np.concatenate([past_norm, p05_full]))
+    ymax = np.nanmax(np.concatenate([past_norm, p95_full]))
+    ax.set_ylim(ymin * 0.95, ymax * 1.05)
+
+    ax.set_xticks([])
+    ax.set_xlabel("")
+
+    ax.legend(loc="upper left", frameon=False)
+
+    ymin_, ymax_ = ax.get_ylim()
+    ax.text(-0.5, ymax_, "过去",
+            ha="center", va="bottom", color="green")
+    ax.text(1.0, ymax_, "未来{}天".format(future_len),
+            ha="center", va="bottom", color="black")
+
+    plt.tight_layout()
     plt.show()
+
+
+
 
 # ------------------------------------------------
 # 总入口函数
@@ -243,8 +393,9 @@ def analyze_shape(code_like,
                   start_date='2010-01-01',
                   horizon=20,
                   neighbor_count=200,
-                  pre_days=20,
-                  max_paths=20):
+                  pre_days=60,
+                  max_neighbors_for_band=None,
+                  line_path_count=20):
 
     code = auto_detect_code(code_like)
     print("识别股票代码:", code)
@@ -259,9 +410,17 @@ def analyze_shape(code_like,
 
     plot_return_distribution(res, horizon)
     plot_neighbors_scatter(res, horizon)
-    plot_price_paths(code, res, horizon, pre_days, max_paths)
+    plot_price_paths(code, res,
+                     horizon=horizon,
+                     pre_days=pre_days,
+                     max_neighbors_for_band=max_neighbors_for_band,
+                     line_path_count=line_path_count)
 
     return res
 
-# 示例调用
-res = analyze_shape("300652")
+res = analyze_shape("300416",
+                    horizon=20,
+                    pre_days=50,            # 过去少一点
+                    max_neighbors_for_band=200,
+                    line_path_count=20)     # 20条红线
+
