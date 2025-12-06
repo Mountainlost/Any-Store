@@ -135,7 +135,7 @@ def m4_handle_data_bigquant_run(context, data):
             # 新买的，当前这根K线还没真正持有，所以先记为0，下一根收盘再 +1
             context.hold_decisions[ins] = 0
 
-    # === 5) 日志 + 钉钉推送（文案沿用“明日买入/卖出”）===
+    # === 5) 日志（文案沿用“明日买入/卖出”）===
     if len(sell_tomorrow) > 0:
         print(f"{today} 收盘信号｜明日卖出: {sell_tomorrow}")
     else:
