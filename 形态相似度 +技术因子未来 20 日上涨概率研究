@@ -1,0 +1,261 @@
+# V1的简版
+# -*- coding: utf-8 -*-
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from jqdata import *
+from datetime import datetime, timedelta
+
+# === 形态特征配置 ===
+SHAPE_FEATURE_COLS = [
+    'ma_5', 'ma_10', 'ma_20',
+    'price_above_ma20',
+    'atr14_pct',
+    'vol_ratio10', 'vol_ratio20',
+    'big_bull', 'break_high20',
+]
+
+_ALL_SECS_DF = None   # 预留缓存位
+
+
+# ============================================================
+# 自动识别股票代码
+# ============================================================
+def auto_detect_code(code_like):
+    """
+    Research 环境专用，智能识别证券代码
+    输入可以是: 300750, '300750', '300750.SZ' 等
+    """
+    s = str(code_like).strip()
+
+    # 已经带后缀
+    if '.' in s:
+        return s.upper()
+
+    # 6 位纯数字，当成 A 股代码补后缀
+    if s.isdigit() and len(s) == 6:
+        if s.startswith(('00', '30')):
+            return s + '.XSHE'
+        elif s.startswith('6'):
+            return s + '.XSHG'
+        else:
+            return s + '.XSHG'
+
+    raise ValueError(f"无法识别股票代码: {code_like}")
+
+
+# ============================================================
+# 在日线 DataFrame 上计算形态因子 + 未来收益
+# ============================================================
+def compute_shape_factors_for_stock(df, horizon20=20):
+    """
+    df: index 为 date, 必须包含 ['open','high','low','close','volume']
+    返回：在 df 基础上增加 SHAPE_FEATURE_COLS 和 next_ret
+    """
+    df = df.copy()
+
+    # ===== 均线 =====
+    df['ma_5']  = df['close'].rolling(5).mean()
+    df['ma_10'] = df['close'].rolling(10).mean()
+    df['ma_20'] = df['close'].rolling(20).mean()
+    df['price_above_ma20'] = (df['close'] > df['ma_20']).astype(int)
+
+    # ===== ATR14 & 波动率 =====
+    tr1 = df['high'] - df['low']
+    tr2 = (df['high'] - df['close'].shift(1)).abs()
+    tr3 = (df['low']  - df['close'].shift(1)).abs()
+    df['tr'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df['atr14'] = df['tr'].rolling(14).mean()
+    df['atr14_pct'] = df['atr14'] / df['close']
+
+    # ===== 成交量均线、量比 =====
+    df['vol_ma10'] = df['volume'].rolling(10).mean()
+    df['vol_ma20'] = df['volume'].rolling(20).mean()
+    df['vol_ratio10'] = df['volume'] / df['vol_ma10']
+    df['vol_ratio20'] = df['volume'] / df['vol_ma20']
+
+    # ===== 大阳线标记（可以按需要调阈值） =====
+    df['big_bull'] = (
+        (df['close'] >= df['open'] * 1.03) &
+        (df['close'] >= df['low']  * 1.06)
+    ).astype(int)
+
+    # ===== 20 日新高相关 =====
+    df['hh_20'] = df['close'].rolling(20).max()
+    df['prev_hh20'] = df['hh_20'].shift(1)
+    df['break_high20'] = (df['close'] > df['prev_hh20']).astype(int)
+
+    # ===== 未来 20 日收益 =====
+    df['next_ret'] = df['close'].shift(-horizon20) / df['close'] - 1
+
+    return df
+
+
+# ============================================================
+# 主函数：形态匹配 + 未来 20 日收益分布
+# ============================================================
+def shape_winrate(code,
+                  as_of_date=None,
+                  start_date='2018-01-01',
+                  horizon20=20,
+                  neighbor_count=200,
+                  verbose=True):
+    """
+    形态匹配：
+    - 如果 as_of_date 为 None：自动取“最新交易日的前一个交易日”作为评估日
+    - 如果 as_of_date 指定：以 <= as_of_date 的最后一根真实 K 线作为评估日
+    """
+
+    # ===== 1. 代码标准化 =====
+    code = auto_detect_code(code)
+
+    # ===== 2. 确定拉取到哪一天的数据 =====
+    if as_of_date is None:
+        # 不指定就拉到今天（或最近交易日），后面再在 df 里取“前一根 K 线”
+        end_dt = datetime.today()
+        as_of_dt = None      # 稍后根据 df 决定
+    else:
+        if isinstance(as_of_date, str):
+            as_of_dt = datetime.strptime(as_of_date, "%Y-%m-%d")
+        elif isinstance(as_of_date, datetime):
+            as_of_dt = as_of_date
+        else:
+            raise TypeError("as_of_date 需要是 str 或 datetime 类型。")
+        end_dt = as_of_dt
+
+    end_str = end_dt.strftime("%Y-%m-%d")
+
+    # ===== 3. 拉取日线数据 =====
+    df = get_price(
+        code,
+        start_date=start_date,
+        end_date=end_str,
+        frequency='daily',
+        fields=['open', 'close', 'high', 'low', 'volume'],
+        fq='pre'
+    )
+
+    if df is None or df.empty:
+        raise ValueError(f"{code}: 从 {start_date} 到 {end_str} 无日线数据。")
+
+    df = df.reset_index().rename(columns={'index': 'date'})
+    df['date'] = pd.to_datetime(df['date'])
+    df.set_index('date', inplace=True)
+
+    # ===== 3.5 过滤“假 K 线” =====
+    fake_mask = (
+        (df['volume'] == 0) &
+        (df['open'] == df['high']) &
+        (df['open'] == df['low']) &
+        (df['open'] == df['close'])
+    )
+    fake_cnt = int(fake_mask.sum())
+    if fake_cnt > 0 and verbose:
+        print(f"[提示] {code}: 发现 {fake_cnt} 根 volume=0 且 OHLC 全相等的异常 K 线，已自动剔除。")
+
+    df = df[~fake_mask].copy()
+    if df.empty:
+        raise ValueError("过滤异常 K 线后，日线数据为空，请检查时间区间。")
+
+    # ===== 4. 决定“评估所用 K 线日期” today_idx =====
+    if as_of_dt is None:
+        # ✅ 自动模式：用“最新交易日的前一个交易日”
+        if len(df) < 2:
+            raise ValueError("数据不足 2 根 K 线，无法取前一日。")
+        today_idx = df.index[-2]                 # 倒数第二根 K 线
+        as_of_dt_display = df.index[-1].date()   # 视作你想评估“最新交易日”
+    else:
+        # 手工指定 as_of_date：用 <= as_of_date 的最后一根真实 K 线
+        candidates = df.index[df.index.date <= as_of_dt.date()]
+        if len(candidates) == 0:
+            raise ValueError(
+                f"{code}: 截至 {as_of_dt.date()} 没有任何真实 K 线数据。"
+            )
+        today_idx = candidates.max()
+        as_of_dt_display = as_of_dt.date()
+
+    eval_date_real = today_idx.date()
+
+    # ===== 5. 计算形态因子 =====
+    df_feat = compute_shape_factors_for_stock(df, horizon20=horizon20)
+
+    # 要求形态因子完整
+    factor_mask = df_feat[SHAPE_FEATURE_COLS].notnull().all(axis=1)
+    df_fact = df_feat[factor_mask].copy()
+    if df_fact.empty:
+        raise ValueError("形态因子有效样本为空，可能是时间区间过短。")
+
+    if today_idx not in df_fact.index:
+        raise ValueError(
+            f"{code}: {eval_date_real} 这根 K 线的形态因子不完整（处于窗口预热期），"
+            f"可以把起始日期 start_date 再往前提一些。"
+        )
+
+    today_row = df_fact.loc[today_idx]
+
+    # ===== 6. 在评估日之前的历史中找邻居（要有 next_ret） =====
+    hist = df_fact[df_fact.index < today_idx].copy()
+    hist = hist[hist['next_ret'].notnull()].copy()
+
+    if hist.empty:
+        raise ValueError("评估日前无带未来收益的历史样本，无法进行形态匹配。")
+
+    if len(hist) < neighbor_count:
+        neighbor_count = len(hist)
+
+    feat_today = today_row[SHAPE_FEATURE_COLS].values.astype(float)
+    feat_hist  = hist[SHAPE_FEATURE_COLS].values.astype(float)
+
+    # 欧氏距离
+    dists = np.linalg.norm(feat_hist - feat_today, axis=1)
+    hist['dist'] = dists
+
+    neighbors = hist.sort_values('dist').head(neighbor_count).copy()
+
+    # ===== 7. 统计未来收益分布 =====
+    rets = neighbors['next_ret']
+    winrate = (rets > 0).mean()
+    avg_ret = rets.mean()
+    p05 = rets.quantile(0.05)
+    p50 = rets.quantile(0.50)
+    p95 = rets.quantile(0.95)
+
+    stats = {
+        'code': code,
+        'as_of_date_request': as_of_dt_display,  # “想评估哪一天”的语义
+        'eval_date_real': eval_date_real,        # 实际用哪根 K 线做形态
+        'winrate': float(winrate),
+        'avg_ret': float(avg_ret),
+        'p05': float(p05),
+        'p50': float(p50),
+        'p95': float(p95),
+        'neighbor_count': int(neighbor_count),
+        'total_hist_samples': int(len(hist)),
+    }
+
+    if verbose:
+        print(f"识别股票代码: {code}")
+        print(f"======== 形态匹配结果（{code}） ========")
+        print(f"评估目标日期(自动/传入): {stats['as_of_date_request']}")
+        print(f"实际使用 K 线日期: {stats['eval_date_real']}")
+        print(f"可用历史样本(可做邻居): {stats['total_hist_samples']}")
+        print(f"匹配邻居数量: {stats['neighbor_count']}")
+        print(f"未来 {horizon20} 日胜率: {stats['winrate']*100:.2f}%")
+        print(f"未来 {horizon20} 日均值收益: {stats['avg_ret']*100:.2f}%")
+        print(
+            f"未来 {horizon20} 日收益 [5%, 50%, 95%]: "
+            f"{stats['p05']*100:.2f}%, "
+            f"{stats['p50']*100:.2f}%, "
+            f"{stats['p95']*100:.2f}%"
+        )
+
+    return today_row, neighbors, stats
+
+today_row, neighbors, stats = shape_winrate(
+    "300652",              # 只修改此处
+    as_of_date=None,       
+    start_date="2018-01-01",
+    horizon20=20,
+    neighbor_count=200,
+    verbose=True
+)
