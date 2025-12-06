@@ -1,0 +1,30 @@
+# 在聚宽研究环境中运行：导出 A 股代码 + 中文名 映射表
+from jqdata import *
+import pandas as pd
+
+def export_stock_name_map():
+    # 1) 取出所有股票基础信息
+    df = get_all_securities(types=['stock'])  # index 是 code，比如 000001.XSHE
+    df = df.reset_index().rename(columns={'index': 'jq_code'})
+
+    # 2) 把聚宽代码后缀 XSHE / XSHG 转成你 Notion / BigQuant 里用的 SZ / SH
+    def to_instrument(code):
+        return code.replace('.XSHE', '.SZ').replace('.XSHG', '.SH')
+
+    df['instrument'] = df['jq_code'].apply(to_instrument)
+
+    # 3) display_name 就是中文名，比如 "航天发展"
+    df['cn_name'] = df['display_name']
+
+    # 4) 只保留代码 + 中文名两列，去重、去空
+    out = df[['instrument', 'cn_name']].dropna().drop_duplicates()
+
+    print('导出记录数：', len(out))
+    print(out.head())
+
+    # 5) 写成 CSV 文件，供你下载
+    csv_str = out.to_csv(index=False, encoding='utf-8-sig')
+    write_file('stock_name_map_jq.csv', csv_str)
+    print('已写入文件：stock_name_map_jq.csv')
+
+export_stock_name_map()
