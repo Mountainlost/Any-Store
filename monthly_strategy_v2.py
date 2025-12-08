@@ -364,7 +364,7 @@ m1 = M.cn_stock_basic_selector.v8(
     indexes=["中证500", "上证指数", "创业板指", "深证成指", "上证50", "沪深300", "中证1000", "中证100", "深证100"],
     st_statuses=["正常"],
     drop_suspended=True,
-    m_name="m1"
+    # m_name="m1"
 )
 
 # 2. Input Features (DAI SQL)
@@ -399,7 +399,7 @@ m2 = M.input_features_dai.v30(
     ),
     expr_tables="cn_stock_prefactors",
     expr_drop_na=True,
-    m_name="m2"
+    # m_name="m2"
 )
 
 # 3. Extract Data
@@ -410,7 +410,7 @@ m3 = M.extract_data_dai.v20(
     end_date="2025-01-01",
     end_date_bound_to_trading_date=True,
     before_start_days=100,
-    m_name="m3"
+    # m_name="m3"
 )
 
 # 4. BigTrader
@@ -426,7 +426,7 @@ m4 = M.bigtrader.v43(
     order_price_field_buy="open",
     order_price_field_sell="open",
     benchmark="沪深300指数",
-    m_name="m4"
+    # m_name="m4"
 )
 
 # </aistudiograph>
