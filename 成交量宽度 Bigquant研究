@@ -1,0 +1,314 @@
+# -*- coding: utf-8 -*-
+from bigmodule import M
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# =========================================================
+# 1) 全局参数（对齐你“成交额宽度_聚宽研究版”的绘图风格）
+# =========================================================
+START_DATE = "2024-01-01"
+END_DATE   = "2025-12-31"
+
+MA_PERIOD = 20
+TURNOVER_AVG_PERIOD = 20
+NUM_GROUPS = 20
+REVERSE_GROUPS = True
+
+SMALL_CAP_COUNT = 400
+LARGE_CAP_COUNT = 100
+
+# ---- 绘图参数（照搬文件）
+PLOT_STYLE = "seaborn-whitegrid"
+HEATMAP_CMAP = "coolwarm"
+ANNOTATE_CELLS = True
+ANNOT_FMT = ".0f"
+HEATMAP_GRID_LINEWIDTHS = 0.5
+
+PLOT_TITLE_MAIN = "Turnover Width Analysis"
+PLOT_TITLE_AUX  = "Auxiliary Metrics"
+PLOT_XLABEL     = "Turnover Groups (G1 highest turnover)"
+
+# ---- 分组依据字段：优先成交额 amount，不存在则回退成交量 volume
+PRIMARY_TURNOVER_FIELD  = "amount"
+FALLBACK_TURNOVER_FIELD = "volume"
+
+# =========================================================
+# 2) DataSource -> pandas 兼容转换（不依赖 to_pandas / data_to_pandas）
+# =========================================================
+def datasource_to_df(ds):
+    import pandas as pd
+
+    for name in ["to_pandas", "to_df", "to_dataframe", "df", "dataframe"]:
+        if hasattr(ds, name) and callable(getattr(ds, name)):
+            out = getattr(ds, name)()
+            if isinstance(out, pd.DataFrame):
+                return out
+
+    for name in ["collect", "fetch", "read", "get_data"]:
+        if hasattr(ds, name) and callable(getattr(ds, name)):
+            out = getattr(ds, name)()
+            if isinstance(out, pd.DataFrame):
+                return out
+            if isinstance(out, (list, tuple)) and len(out) > 0 and isinstance(out[0], dict):
+                return pd.DataFrame(out)
+
+    try:
+        out = list(ds)
+        if len(out) > 0 and isinstance(out[0], dict):
+            return pd.DataFrame(out)
+    except Exception:
+        pass
+
+    raise TypeError("无法把当前 DataSource 转成 pandas.DataFrame：该对象未暴露可用导出接口。")
+
+# =========================================================
+# 3) 拉取研究数据：选股池 -> input_features_dai -> extract_data_dai
+#    统一把分组依据命名成 turnover_ma20（成交额/成交量均线）
+# =========================================================
+def build_and_fetch(turnover_field: str):
+    m1 = M.cn_stock_basic_selector.v8(
+        exchanges=["上交所", "深交所"],
+        list_sectors=["主板", "创业板"],
+        st_statuses=["正常"],
+        drop_suspended=True,
+        m_name="m1"
+    )
+
+    expr = (
+        "close AS close\n"
+        "volume AS volume\n"
+        f"{turnover_field} AS turnover_raw\n"
+        f"m_avg(close, {MA_PERIOD}) AS ma20\n"
+        f"m_avg({turnover_field}, {TURNOVER_AVG_PERIOD}) AS turnover_ma20\n"
+        f"IF(close > m_avg(close, {MA_PERIOD}), 1, 0) AS above_ma20\n"
+    )
+
+    expr_filters = (
+        "list_days > 365\n"
+        "st_status = 0\n"
+        "suspended = 0\n"
+    )
+
+    m2 = M.input_features_dai.v30(
+        input_1=m1.data,
+        mode="表达式",
+        expr=expr,
+        expr_filters=expr_filters,
+        expr_tables="cn_stock_prefactors",
+        expr_drop_na=True,
+        m_name="m2"
+    )
+
+    m3 = M.extract_data_dai.v20(
+        sql=m2.data,
+        start_date=START_DATE,
+        start_date_bound_to_trading_date=True,
+        end_date=END_DATE,
+        end_date_bound_to_trading_date=True,
+        before_start_days=max(MA_PERIOD, TURNOVER_AVG_PERIOD) + 5,
+        m_name="m3"
+    )
+
+    return datasource_to_df(m3.data)
+
+# 优先成交额 amount，失败回退成交量 volume（不让你卡死）
+try:
+    df = build_and_fetch(PRIMARY_TURNOVER_FIELD)
+    USED_TURNOVER_FIELD = PRIMARY_TURNOVER_FIELD
+except Exception as e:
+    print(f"[WARN] {PRIMARY_TURNOVER_FIELD} 不可用，回退到 {FALLBACK_TURNOVER_FIELD}。原因：{e}")
+    df = build_and_fetch(FALLBACK_TURNOVER_FIELD)
+    USED_TURNOVER_FIELD = FALLBACK_TURNOVER_FIELD
+
+print("[INFO] 分组依据字段来自：", USED_TURNOVER_FIELD)
+print("[INFO] 原始数据：", df.shape)
+
+# =========================================================
+# 4) 自检 + 预处理
+# =========================================================
+required_cols = {"date", "instrument", "close", "volume", "ma20", "turnover_ma20", "above_ma20"}
+missing = required_cols - set(df.columns)
+if missing:
+    raise ValueError(f"[自检失败] 缺少字段: {missing}. 请检查 expr/expr_tables 或字段名。")
+
+df = df.copy()
+df["date"] = pd.to_datetime(df["date"])
+df = df.sort_values(["date", "instrument"])
+df = df.dropna(subset=["ma20", "turnover_ma20"])
+
+# =========================================================
+# 5) 计算“宽度矩阵”
+#    每个交易日：按 turnover_ma20 分 20 组 -> 计算各组 above_ma20 的比例*100
+# =========================================================
+dates = df["date"].drop_duplicates().sort_values()
+width_rows, row_dates = [], []
+group_cols = [f"组{i+1}" for i in range(NUM_GROUPS)]
+
+for d in dates:
+    day = df[df["date"] == d]
+    if day.empty:
+        continue
+
+    x = day["turnover_ma20"].to_numpy(dtype=float)
+    y = day["above_ma20"].to_numpy(dtype=float)  # 0/1
+
+    valid = np.isfinite(x)
+    if valid.sum() == 0:
+        continue
+
+    x = x[valid]
+    y = y[valid]
+    n = x.shape[0]
+
+    order = np.argsort(x, kind="mergesort")
+    rank = np.empty(n, dtype=np.int32)
+    rank[order] = np.arange(n)
+
+    g = (rank * NUM_GROUPS) // n
+    if REVERSE_GROUPS:
+        g = (NUM_GROUPS - 1) - g
+
+    sum_y = np.bincount(g, weights=y, minlength=NUM_GROUPS)
+    cnt_g = np.bincount(g, minlength=NUM_GROUPS)
+    pct = np.where(cnt_g > 0, (sum_y / cnt_g) * 100.0, 0.0)
+
+    width_rows.append(pct)
+    row_dates.append(d)
+
+width_df = pd.DataFrame(width_rows, index=row_dates, columns=group_cols).sort_index()
+width_df.index.name = "交易日期"
+if width_df.empty:
+    raise ValueError("未能计算任何宽度数据：请检查日期范围/过滤条件/预热窗口。")
+
+# =========================================================
+# 6) 辅助指标：市场均值 + 热度差 +（可选）小盘/大盘热度
+#    total_market_cap 从估值表尝试抽取，失败则自动跳过
+# =========================================================
+aux_df = pd.DataFrame(index=width_df.index)
+aux_df["市场均值"] = width_df.mean(axis=1)
+aux_df["大小热度差"] = (width_df["组1"] - width_df[f"组{NUM_GROUPS}"]).abs()
+
+cap_df = None
+try:
+    valuation_sql = f"""
+    SELECT date, instrument, total_market_cap
+    FROM cn_stock_valuation_daily
+    WHERE date >= '{START_DATE}' AND date <= '{END_DATE}'
+    """
+    m_cap = M.extract_data_dai.v20(
+        sql=valuation_sql,
+        start_date=START_DATE,
+        start_date_bound_to_trading_date=True,
+        end_date=END_DATE,
+        end_date_bound_to_trading_date=True,
+        before_start_days=0,
+        m_name="m_cap"
+    )
+    cap_df = datasource_to_df(m_cap.data)
+    cap_df["date"] = pd.to_datetime(cap_df["date"])
+    cap_df = cap_df.dropna(subset=["total_market_cap"])
+    print("[INFO] 成功抽取 total_market_cap：", cap_df.shape)
+except Exception as e:
+    print("[WARN] total_market_cap 抽取失败：将跳过小/大盘热度。原因：", e)
+    cap_df = None
+
+if cap_df is not None and not cap_df.empty:
+    tmp = df.merge(cap_df, on=["date", "instrument"], how="left").dropna(subset=["total_market_cap"])
+    small_heat, large_heat = {}, {}
+
+    for d in width_df.index:
+        day = tmp[tmp["date"] == d]
+        if day.empty:
+            small_heat[d] = 0.0
+            large_heat[d] = 0.0
+            continue
+
+        day_small = day.nsmallest(SMALL_CAP_COUNT, "total_market_cap")
+        day_large = day.nlargest(LARGE_CAP_COUNT, "total_market_cap")
+
+        small_heat[d] = float(day_small["above_ma20"].mean() * 100.0) if len(day_small) else 0.0
+        large_heat[d] = float(day_large["above_ma20"].mean() * 100.0) if len(day_large) else 0.0
+
+    aux_df["小盘热度"] = pd.Series(small_heat)
+    aux_df["大盘热度"] = pd.Series(large_heat)
+
+print("width_df shape:", width_df.shape)
+print("aux_df shape:", aux_df.shape)
+
+# =========================================================
+# 7) 画图：颜色/风格“照搬”你文件里的 seaborn heatmap 参数
+# =========================================================
+import seaborn as sns
+
+sns.set_theme(
+    style="whitegrid",
+    font_scale=1.0
+)
+
+# 日期倒序（最近在上）
+plot_width = width_df.sort_index(ascending=False).copy()
+plot_aux = aux_df.loc[plot_width.index].copy()
+
+plot_width.index = pd.to_datetime(plot_width.index).strftime("%Y-%m-%d")
+plot_aux.index = pd.to_datetime(plot_aux.index).strftime("%Y-%m-%d")
+
+# 列名英文化：组 -> G1..G20；Aux -> 英文列（对齐图一）
+width_rename = {f"组{i+1}": f"G{i+1}" for i in range(NUM_GROUPS)}
+plot_width.rename(columns=width_rename, inplace=True)
+
+AUX_COL_RENAME = {
+    "小盘热度": "SmallCapHeat",
+    "大盘热度": "LargeCapHeat",
+    "大小热度差": "HeatDiff",
+    "市场均值": "MktAvg",
+}
+plot_aux.rename(columns=AUX_COL_RENAME, inplace=True)
+
+# 右侧列顺序固定成图一
+aux_cols_order = [c for c in ["SmallCapHeat", "LargeCapHeat", "HeatDiff", "MktAvg"] if c in plot_aux.columns]
+plot_aux = plot_aux[aux_cols_order] if aux_cols_order else plot_aux
+
+# 画布：左宽右窄
+n_rows = len(plot_width)
+fig_h = min(10 + 0.15 * n_rows, 80)
+fig, (ax0, ax1) = plt.subplots(
+    1, 2, figsize=(18, fig_h),
+    gridspec_kw={"width_ratios": [26, 5], "wspace": 0.05},
+    constrained_layout=True, sharey=True
+)
+
+sns.heatmap(
+    plot_width,
+    annot=ANNOTATE_CELLS, fmt=ANNOT_FMT,
+    cmap=HEATMAP_CMAP,
+    ax=ax0, cbar=False,
+    linewidths=HEATMAP_GRID_LINEWIDTHS
+)
+ax0.set_title(PLOT_TITLE_MAIN, fontsize=20, pad=40)
+ax0.set_xlabel(PLOT_XLABEL, fontsize=14)
+ax0.xaxis.tick_top()
+ax0.xaxis.set_label_position("top")
+
+# tick 加粗（对齐图一）
+for label in ax0.get_yticklabels():
+    label.set_fontweight("bold")
+for label in ax0.get_xticklabels():
+    label.set_fontweight("bold")
+
+sns.heatmap(
+    plot_aux,
+    annot=ANNOTATE_CELLS, fmt=ANNOT_FMT,
+    cmap=HEATMAP_CMAP,
+    ax=ax1, cbar=False,
+    linewidths=HEATMAP_GRID_LINEWIDTHS
+)
+ax1.set_title(PLOT_TITLE_AUX, fontsize=20, pad=40)
+ax1.set_xlabel("")
+ax1.xaxis.tick_top()
+ax1.xaxis.set_label_position("top")
+plt.setp(ax1.get_yticklabels(), visible=False)
+for label in ax1.get_xticklabels():
+    label.set_fontweight("bold")
+
+plt.show()
